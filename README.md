@@ -1,7 +1,7 @@
 # optimization-visualizer
 Visualize advanced concepts in mathematical optimization, analysis, and topology.
 
-Built on NumPy, SciPy, and Matplotlib.
+Built w/ numpy, scipy, matplotlib...
 
 ## Setup
 
