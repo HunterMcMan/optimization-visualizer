@@ -1,0 +1,2 @@
+This project is a tool to visualize concepts in mathematical optimization, analysis, and topology, pertaining to an undergraduate-level course in optimization. Separate into three main folders: optimization, analysis, topology, with relevant information, plots, and tools in each. Use NumPy, SciPy, Matplotlib, and any other necessary libraries to build graphs and plots. Make each topic interactive and allow the user to enter parameters relating to the current topic, where possible. 
+
