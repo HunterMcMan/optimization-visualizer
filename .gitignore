@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Reference notes kept locally, not in the repo
+kktMIT.pdf
