@@ -24,26 +24,28 @@ shape of S (closed? bounded?) decides whether each point is a global extremum.
 """
 
 from dataclasses import dataclass, field
-import threading
 from typing import Callable, Optional
 
 import numpy as np
 import sympy as sp
-import contourpy
 import matplotlib.pyplot as plt
-from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, Slider, TextBox
-from scipy.optimize import brentq, least_squares
+
+if __package__:  # imported from the optimization package (app.py, the exe)
+    from .common import (X, Y, XY, SecondaryWindow, at, circle_crossings,
+                         disconnect_axes3d, fmt, level_curves, parse_expr, parse_window,
+                         set_opacity, singular, solve, value_limits, vec, vectorize)
+else:  # run as a script: python optimization/lagrange.py
+    from common import (X, Y, XY, SecondaryWindow, at, circle_crossings,
+                        disconnect_axes3d, fmt, level_curves, parse_expr, parse_window,
+                        set_opacity, singular, solve, value_limits, vec, vectorize)
 
 F_INIT = "x + y"
 G_INIT = "x^2 + y^2 = 1"
 W_INIT = "2"            # plot window: half-width, or "cx, cy, half-width"
 GRID = 200              # grid size for the contour view
 GRID_3D = 70            # grid size for the 3D surface
-SOLVE_TIMEOUT = 8.0     # seconds for SymPy before falling back to numeric root finding
-NUMERIC_STARTS = 12     # numeric root finding starts from a 12 x 12 grid over the window
-MAX_POINTS = 60         # more critical points than this means a curve of them
 RANK_TOL = 1e-8         # relative singular value below which grad g_i are dependent
 SOSC_TOL = 1e-9         # relative size below which q or a bordered minor counts as 0
 LOCAL_RADII = (1e-3, 3e-3, 1e-2)  # circles (times half-width) for the numeric local check
@@ -56,10 +58,6 @@ ALPHAS = {"f": 0.5, "constraint": 1.0, "level": 0.3}
 CONSTRAINT_COLORS = ["tab:purple", "tab:brown", "tab:cyan", "tab:olive"]
 KIND_COLORS = {"max": "tab:red", "min": "tab:blue", "neither": "dimgray"}
 OTHER_COLOR = "tab:green"  # isolated points, f constant nearby, unknown
-
-X = sp.Symbol("x", real=True)
-Y = sp.Symbol("y", real=True)
-XY = (X, Y)
 
 
 @dataclass
@@ -106,80 +104,6 @@ class Problem:
     notes: list          # extra messages
 
 
-def _as_float(value, what):
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{what} is not a real number: {value}")
-    if not np.isfinite(out):
-        raise ValueError(f"{what} is not finite: {value}")
-    return out
-
-
-def _vectorize(fn):
-    def f(*coords):
-        coords = np.broadcast_arrays(*(np.asarray(c, dtype=float) for c in coords))
-        with np.errstate(all="ignore"):
-            out = np.asarray(fn(*coords))
-        if np.iscomplexobj(out):
-            out = np.where(np.abs(out.imag) < 1e-12, out.real, np.nan)
-        return np.broadcast_to(out.astype(float), coords[0].shape)
-    return f
-
-
-def _at(fn, p):
-    """Evaluate a lambdified (nested) list of expressions at the point p."""
-    with np.errstate(all="ignore"):
-        out = np.array(fn(*p), dtype=complex)
-    return np.where(np.abs(out.imag) < 1e-12, out.real, np.nan)
-
-
-def _fmt(v):
-    v = float(v)
-    return "0" if abs(v) < 5e-13 else f"{v:.4g}"
-
-
-def _vec(v):
-    return "(" + ", ".join(_fmt(c) for c in v) + ")"
-
-
-def _with_timeout(fn, timeout):
-    """Run fn() in a daemon thread; raise TimeoutError if it takes too long."""
-    box = {}
-
-    def run():
-        try:
-            box["out"] = fn()
-        except Exception as err:
-            box["err"] = err
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        raise TimeoutError
-    if "err" in box:
-        raise box["err"]
-    return box["out"]
-
-
-def _parse_expr(text, what):
-    try:
-        expr = sp.sympify(text, locals={"x": X, "y": Y}, convert_xor=True)
-    except (sp.SympifyError, SyntaxError, TypeError):
-        raise ValueError(f"Could not parse {what} = {text.strip()!r}")
-    if not isinstance(expr, sp.Expr):
-        raise ValueError(f"{what} = {text.strip()!r} is not an expression")
-    extra = expr.free_symbols - {X, Y}
-    if extra:
-        raise ValueError(f"Unknown variable(s) in {what}: {', '.join(sorted(map(str, extra)))} "
-                         "(use x and y)")
-    unknown = expr.atoms(sp.core.function.AppliedUndef)
-    if unknown:
-        raise ValueError(f"Unknown function(s) in {what}: {', '.join(sorted(map(str, unknown)))}")
-    return expr
-
-
 def _parse_constraints(text):
     pieces = [piece.strip() for piece in text.split(";") if piece.strip()]
     if not pieces:
@@ -192,8 +116,8 @@ def _parse_constraints(text):
         sides = piece.split("=")
         if len(sides) > 2:
             raise ValueError(f"Constraint {i} ({piece}) has more than one '='")
-        lhs = _parse_expr(sides[0], f"constraint {i}")
-        rhs = _parse_expr(sides[1], f"constraint {i}") if len(sides) == 2 else sp.Integer(0)
+        lhs = parse_expr(sides[0], f"constraint {i}")
+        rhs = parse_expr(sides[1], f"constraint {i}") if len(sides) == 2 else sp.Integer(0)
         h = lhs - rhs
         if not h.free_symbols or sp.simplify(h) == 0:
             always = sp.simplify(h) == 0
@@ -203,119 +127,10 @@ def _parse_constraints(text):
     return cons
 
 
-def _parse_window(text):
-    try:
-        parsed = sp.sympify(text, convert_xor=True)
-    except (sp.SympifyError, SyntaxError, TypeError):
-        raise ValueError(f"Could not parse window = {text!r}")
-    vals = tuple(parsed) if isinstance(parsed, (sp.Tuple, tuple)) else (parsed,)
-    if len(vals) not in (1, 3):
-        raise ValueError("window should be a half-width (e.g. 3) or cx, cy, half-width")
-    vals = [_as_float(v, "window") for v in vals]
-    cx, cy, hw = (0.0, 0.0, vals[0]) if len(vals) == 1 else vals
-    if hw <= 0:
-        raise ValueError("The window half-width must be positive")
-    return cx, cy, hw
-
-
-def _singular(expr):
-    """True if expr may be discontinuous (a symbolic denominator, log, tan, ...)."""
-    _, den = sp.fraction(sp.together(expr))
-    return bool(den.free_symbols) or expr.has(sp.log, sp.tan, sp.cot, sp.sec, sp.csc,
-                                              sp.sign, sp.floor, sp.ceiling)
-
-
-def _dedup(pts, scale):
-    out = []
-    for p in pts:
-        if all(np.hypot(*(p - q)) > 1e-6 * max(1.0, scale) for q in out):
-            out.append(np.asarray(p, dtype=float))
-    return out
-
-
-def _numeric_solutions(eqs, window):
-    """Real roots of eqs = 0 (at least two equations) by multistart least squares."""
-    cx, cy, hw = window
-    F = sp.lambdify(XY, list(eqs), "numpy")
-    jac = sp.lambdify(XY, sp.Matrix(eqs).jacobian(XY).tolist(), "numpy")
-    res = lambda z: _at(F, z)
-    jac_at = lambda z: _at(jac, z)
-    g = np.linspace(-hw, hw, NUMERIC_STARTS)
-    pts = []
-    for sx in g:
-        for sy in g:
-            try:
-                sol = least_squares(res, [cx + sx, cy + sy], jac=jac_at, method="lm",
-                                    xtol=1e-15, ftol=1e-15, gtol=1e-15, max_nfev=400)
-            except (ValueError, np.linalg.LinAlgError):
-                continue  # started outside the domain of an equation
-            if np.all(np.isfinite(sol.fun)) and np.max(np.abs(sol.fun)) < 1e-9:
-                pts.append(sol.x)
-    return _dedup(pts, hw)
-
-
-def _solve(eqs, window):
-    """Real (x, y) solutions of eqs = 0.
-
-    Returns (points, exact, continuum): exact is False when the numeric fallback
-    (which only searches near the window) was used; continuum is True when part of
-    the solution set is a curve rather than isolated points.
-    """
-    nums, dens = zip(*(sp.fraction(sp.together(e)) for e in eqs))
-    if all(e.is_polynomial(X, Y) for e in nums + dens):
-        try:
-            sols = _with_timeout(lambda: sp.solve(list(nums), XY, dict=True), SOLVE_TIMEOUT)
-        except Exception:
-            sols = None
-        if sols is not None:
-            den_fns = [_vectorize(sp.lambdify(XY, d, "numpy")) for d in dens]
-            pts, continuum = [], False
-            for sol in sols:
-                if any(s not in sol or sol[s].free_symbols for s in XY):
-                    continuum = True
-                    continue
-                try:
-                    z = [complex(sp.N(sol[s], 30)) for s in XY]
-                except TypeError:
-                    continue
-                if max(abs(c.imag) for c in z) > 1e-9:
-                    continue
-                p = np.array([c.real for c in z])
-                if all(abs(float(d(*p))) > 1e-12 for d in den_fns):
-                    pts.append(p)
-            return _dedup(pts, window[2]), True, continuum
-    pts = _numeric_solutions(eqs, window)
-    if len(pts) > MAX_POINTS:
-        return [], False, True
-    return pts, False, False
-
-
-def _circle_crossings(hs, c, r, n):
-    """Points of S = {h_i = 0} on the circle of radius r around c.
-
-    Finds sign changes of h_1 around the circle, refines each with brentq, and keeps
-    those where the other constraints also hold.
-    """
-    t = np.linspace(0, 2 * np.pi, n + 1)
-    v = hs[0](c[0] + r * np.cos(t), c[1] + r * np.sin(t))
-    on_circle = lambda a: (c[0] + r * np.cos(a), c[1] + r * np.sin(a))
-    h0 = lambda a: float(hs[0](*on_circle(a)))
-    angles = list(t[:-1][v[:-1] == 0])
-    for i in np.nonzero(np.sign(v[:-1]) * np.sign(v[1:]) < 0)[0]:
-        try:
-            angles.append(brentq(h0, t[i], t[i + 1], xtol=1e-14))
-        except ValueError:
-            continue
-    pts = np.array([on_circle(a) for a in angles]).reshape(-1, 2)
-    for h in hs[1:]:
-        pts = pts[np.abs(h(pts[:, 0], pts[:, 1])) < 1e-6 * (1 + r)]
-    return pts
-
-
 def _local_numeric(prob_f, hs, p, f0, hw):
     """Compare f(p) with f on S near p: min, max, neither, flat, or isolated."""
     for r in np.array(LOCAL_RADII) * hw:
-        near = _circle_crossings(hs, p, r, 720)
+        near = circle_crossings(hs, p, r, 720)
         if len(near):
             break
     else:
@@ -336,8 +151,8 @@ def _analyze(p, f_fn, hs, derivs, hw):
     """Lagrange multipliers and second-order tests at the critical point p."""
     grad_f_fn, hess_f_fn, jac_fn, hess_h_fns = derivs
     m = len(hs)
-    grad_f = _at(grad_f_fn, p)
-    J = _at(jac_fn, p).reshape(m, 2)
+    grad_f = at(grad_f_fn, p)
+    J = at(jac_fn, p).reshape(m, 2)
     sv = np.linalg.svd(J, compute_uv=False)
     rank = int(np.sum(sv > RANK_TOL * max(1.0, sv.max())))
     lam = np.linalg.lstsq(J.T, grad_f, rcond=None)[0]
@@ -345,7 +160,7 @@ def _analyze(p, f_fn, hs, derivs, hw):
     cp = CritPoint(p, float(f_fn(*p)), grad_f, J, rank, lam, bool(lam_exists))
 
     if cp.cq:
-        H_L = _at(hess_f_fn, p) - sum(l * _at(fn, p) for l, fn in zip(lam, hess_h_fns))
+        H_L = at(hess_f_fn, p) - sum(l * at(fn, p) for l, fn in zip(lam, hess_h_fns))
         B = np.block([[np.zeros((m, m)), J], [J.T, H_L]])
         # Last n - m leading principal minors (n = 2): sign (-1)^m for a min,
         # sign (-1)^(k - m) for the k x k minor for a max.
@@ -382,14 +197,14 @@ def _analyze(p, f_fn, hs, derivs, hw):
 
 def parse(f_text, g_text, w_text):
     """Parse user input, find and classify the critical points. Raises ValueError."""
-    expr = _parse_expr(f_text, "f")
+    expr = parse_expr(f_text, "f")
     cons = _parse_constraints(g_text)
-    window = _parse_window(w_text)
+    window = parse_window(w_text)
     cx, cy, hw = window
     m = len(cons)
     hexprs = [c.h for c in cons]
-    f = _vectorize(sp.lambdify(XY, expr, "numpy"))
-    hs = [_vectorize(sp.lambdify(XY, h, "numpy")) for h in hexprs]
+    f = vectorize(sp.lambdify(XY, expr, "numpy"))
+    hs = [vectorize(sp.lambdify(XY, h, "numpy")) for h in hexprs]
     derivs = (sp.lambdify(XY, [sp.diff(expr, s) for s in XY], "numpy"),
               sp.lambdify(XY, sp.hessian(expr, XY).tolist(), "numpy"),
               sp.lambdify(XY, [[sp.diff(h, s) for s in XY] for h in hexprs], "numpy"),
@@ -402,7 +217,7 @@ def parse(f_text, g_text, w_text):
         rng = np.random.default_rng(0)
         ranks = []
         for p in rng.uniform(-hw, hw, (20, 2)) + (cx, cy):
-            J = _at(derivs[2], p)
+            J = at(derivs[2], p)
             if np.all(np.isfinite(J)):
                 sv = np.linalg.svd(J, compute_uv=False)
                 ranks.append(np.sum(sv > RANK_TOL * max(1.0, sv.max())))
@@ -421,11 +236,11 @@ def parse(f_text, g_text, w_text):
         if sp.simplify(det) == 0:
             raise ValueError("grad f is parallel to grad g everywhere, so f is constant on "
                              "each piece of S: every feasible point is critical")
-        pts, exact, continuum = _solve([h, det], window)
+        pts, exact, continuum = solve([h, det], window)
         if continuum:
             notes.append("f is constant along part of S (a curve of critical points, not shown)")
     else:
-        pts, exact, continuum = _solve(hexprs, window)
+        pts, exact, continuum = solve(hexprs, window)
         if continuum:
             notes.append("The constraints share a whole curve of solutions (not shown)")
     if not exact:
@@ -438,11 +253,11 @@ def parse(f_text, g_text, w_text):
     # Feasible set: closed unless a constraint has a singularity; bounded if it never
     # meets a far-away circle. With two or more constraints S is the finite set of
     # feasible points found above.
-    closed = not any(_singular(h) for h in hexprs)
+    closed = not any(singular(h) for h in hexprs)
     samples = np.empty((0, 2))
     if m == 1:
         radii = np.geomspace(1e-2 * hw, FAR_RADIUS * max(1.0, hw), FAR_CIRCLES)
-        rings = [_circle_crossings(hs, (cx, cy), R, CIRCLE_ANGLES) for R in radii]
+        rings = [circle_crossings(hs, (cx, cy), R, CIRCLE_ANGLES) for R in radii]
         samples = np.vstack(rings)
         bounded = len(rings[-1]) == 0
         if not points and not len(samples):
@@ -461,7 +276,7 @@ def parse(f_text, g_text, w_text):
         S_text += " ⇒ compact: f has a global max and min on S (EVT)"
     elif closed and not bounded:
         S_text += " ⇒ not compact: global extrema may not exist"
-    if _singular(expr):
+    if singular(expr):
         notes.append("f may be discontinuous, so the extreme value theorem may not apply")
 
     # A global max on S (if any) is at a candidate. It fails to exist exactly when some
@@ -502,41 +317,6 @@ def label(cp):
             "unknown": "unknown"}[cp.local]
 
 
-def _value_limits(values, extra=()):
-    """Display range for f: robust to asymptotes, always showing the critical values."""
-    finite = values[np.isfinite(values)]
-    lo, hi = np.percentile(finite, [2, 98]) if finite.size else (0.0, 1.0)
-    lo, hi = min([lo, *extra]), max([hi, *extra])
-    if hi - lo < 1e-9:
-        lo, hi = lo - 1, hi + 1
-    pad = 0.05 * (hi - lo)
-    return lo - pad, hi + pad
-
-
-def _level_curves(fn, X, Y, Z, level):
-    """Pieces of the curve fn = level, from a grid Z = fn(X, Y), as N x 2 arrays.
-
-    Contouring connects +inf to -inf across a pole (e.g. 1/x), so points where fn is
-    not actually close to the level are replaced by NaN to break the line there.
-    """
-    gen = contourpy.contour_generator(X, Y, np.ma.masked_invalid(Z))
-    scale = np.nanmedian(np.abs(Z - level)) if np.isfinite(Z).any() else 1.0
-    out = []
-    for seg in gen.lines(level):
-        seg = np.array(seg, dtype=float)
-        bad = ~(np.abs(fn(seg[:, 0], seg[:, 1]) - level) <= 0.1 * scale)
-        seg[bad] = np.nan
-        out.append(seg)
-    return out
-
-
-def _set_opacity(artist, alpha):
-    """Set an artist's alpha, hiding it entirely at 0 so no edges are left behind."""
-    artist.set_alpha(alpha)
-    artist.set_visible(alpha > 0)
-    return artist
-
-
 class View:
     """Contours of f with the constraints (left) and the graph of f (right)."""
 
@@ -553,7 +333,7 @@ class View:
         self.Z = prob.f(self.X, self.Y)
         self.shown = [cp for cp in prob.points
                       if abs(cp.p[0] - cx) <= hw and abs(cp.p[1] - cy) <= hw]
-        self.lo, self.hi = _value_limits(self.Z, [cp.f for cp in self.shown])
+        self.lo, self.hi = value_limits(self.Z, [cp.f for cp in self.shown])
         Zc = np.ma.masked_invalid(np.clip(self.Z, self.lo, self.hi))
 
         ax = self.ax2
@@ -563,7 +343,7 @@ class View:
         self.con_artists, handles, self.con_segs = [], [], []
         for i, (con, h) in enumerate(zip(prob.cons, prob.hs)):
             color = CONSTRAINT_COLORS[i % len(CONSTRAINT_COLORS)]
-            segs = _level_curves(h, self.X, self.Y, h(self.X, self.Y), 0.0)
+            segs = level_curves(h, self.X, self.Y, h(self.X, self.Y), 0.0)
             self.con_segs.append(segs)
             for seg in segs:
                 self.con_artists.append(ax.plot(seg[:, 0], seg[:, 1], color=color, lw=2)[0])
@@ -627,15 +407,15 @@ class View:
         cx, cy, hw = prob.window
 
         for artist in (self.fill, self.lines, self.surface):
-            _set_opacity(artist, alphas["f"])
+            set_opacity(artist, alphas["f"])
         for artist in self.con_artists:
-            _set_opacity(artist, alphas["constraint"])
+            set_opacity(artist, alphas["constraint"])
 
         # Level curve f = k and the plane z = k.
-        for seg in _level_curves(prob.f, self.X, self.Y, self.Z, k):
+        for seg in level_curves(prob.f, self.X, self.Y, self.Z, k):
             self.dynamic.append(ax.plot(seg[:, 0], seg[:, 1], color="tab:orange", lw=2)[0])
         px, py = np.meshgrid([cx - hw, cx + hw], [cy - hw, cy + hw])
-        self.dynamic.append(_set_opacity(ax3.plot_surface(
+        self.dynamic.append(set_opacity(ax3.plot_surface(
             px, py, np.full_like(px, k), color="tab:orange", linewidth=0), alphas["level"]))
 
         if sel is None:
@@ -644,7 +424,7 @@ class View:
         self.dynamic.append(ax.plot(*cp.p, "o", ms=17, mfc="none", mec="black", mew=1.5,
                                     zorder=7)[0])
         if self.lo < cp.f < self.hi:
-            for seg in _level_curves(prob.f, self.X, self.Y, self.Z, cp.f):
+            for seg in level_curves(prob.f, self.X, self.Y, self.Z, cp.f):
                 self.dynamic.append(ax.plot(seg[:, 0], seg[:, 1], color="black", ls="--",
                                             lw=1.2, zorder=5)[0])
             self.dynamic.append(ax3.scatter([cp.p[0]], [cp.p[1]], [cp.f], s=250,
@@ -687,13 +467,7 @@ class View:
                                             textcoords="offset points", zorder=9))
 
     def remove(self):
-        # Axes3D connects mouse handlers to the canvas that remove() leaves behind;
-        # its release handler then fails on every click once the axes has no figure.
-        registry = self.ax3.get_figure(root=True).canvas.callbacks
-        for signal in ("motion_notify_event", "button_press_event", "button_release_event"):
-            for cid, ref in list(registry.callbacks.get(signal, {}).items()):
-                if getattr(ref(), "__self__", None) is self.ax3:
-                    registry.disconnect(cid)
+        disconnect_axes3d(self.ax3)
         for ax in self.axes:
             ax.remove()
 
@@ -712,15 +486,15 @@ def describe(prob, sel):
         return ("No critical points: f has no extremum on S", "", "", "black")
     cp, m, n = prob.points[sel], len(prob.cons), len(prob.points)
     tol = SOSC_TOL * (1 + np.abs(cp.minors).max()) if cp.minors else 0
-    lines = [f"Point {sel + 1} of {n}:   p = {_vec(cp.p)},   f(p) = {_fmt(cp.f)}"]
-    lam = _fmt(cp.lam[0]) if m == 1 else _vec(cp.lam)
-    grads = ",  ".join(rf"$\nabla g{'_' + str(i + 1) if m > 1 else ''}$ = {_vec(row)}"
+    lines = [f"Point {sel + 1} of {n}:   p = {vec(cp.p)},   f(p) = {fmt(cp.f)}"]
+    lam = fmt(cp.lam[0]) if m == 1 else vec(cp.lam)
+    grads = ",  ".join(rf"$\nabla g{'_' + str(i + 1) if m > 1 else ''}$ = {vec(row)}"
                        for i, row in enumerate(cp.J))
     if cp.cq:
-        lines.append(rf"$\nabla f$ = {_vec(cp.grad_f)},  {grads},  $\lambda$ = {lam}")
+        lines.append(rf"$\nabla f$ = {vec(cp.grad_f)},  {grads},  $\lambda$ = {lam}")
     else:
         why = "λ is not unique" if cp.lam_exists else "no λ exists"
-        lines.append(rf"CQ fails (rank J = {cp.rank} < {m}): $\nabla f$ = {_vec(cp.grad_f)}, "
+        lines.append(rf"CQ fails (rank J = {cp.rank} < {m}): $\nabla f$ = {vec(cp.grad_f)}, "
                      f"{grads}; {why}")
 
     if cp.tangent == "isolated":
@@ -729,12 +503,12 @@ def describe(prob, sel):
         lines.append(r"Bordered Hessian: $\bar H$ is 4×4 and n − m = 0, so no minors to check")
     elif cp.cq:
         qt = SOSC_TOL * (1 + abs(cp.q))
-        lines.append(rf"Tangent test: $d$ = {_vec(cp.d)},  $q = d^T\nabla^2 L\,d$ = {_fmt(cp.q)} "
+        lines.append(rf"Tangent test: $d$ = {vec(cp.d)},  $q = d^T\nabla^2 L\,d$ = {fmt(cp.q)} "
                      f"{_sign_text(cp.q, qt)} ⇒ {VERDICT[cp.tangent]}")
         det = cp.minors[0]
         check = -float(cp.J[0] @ cp.J[0]) * cp.q
-        lines.append(rf"Bordered Hessian: $\det\bar H$ = {_fmt(det)} {_sign_text(det, tol)} "
-                     rf"⇒ {VERDICT[cp.bordered]}   (agrees: $-|\nabla g|^2 q$ = {_fmt(check)})")
+        lines.append(rf"Bordered Hessian: $\det\bar H$ = {fmt(det)} {_sign_text(det, tol)} "
+                     rf"⇒ {VERDICT[cp.bordered]}   (agrees: $-|\nabla g|^2 q$ = {fmt(check)})")
     else:
         lines.append("Tangent test and bordered Hessian: not applicable where the CQ fails")
 
@@ -765,11 +539,11 @@ def describe(prob, sel):
     else:
         parts = []
         if cp.local in ("max", "isolated", "flat"):
-            parts.append("not a global max: " + (f"f = {_fmt(max(fs))} at another candidate"
+            parts.append("not a global max: " + (f"f = {fmt(max(fs))} at another candidate"
                                                  if prob.has_max else
                                                  "f is larger elsewhere on S (no global max)"))
         if cp.local in ("min", "isolated", "flat"):
-            parts.append("not a global min: " + (f"f = {_fmt(min(fs))} at another candidate"
+            parts.append("not a global min: " + (f"f = {fmt(min(fs))} at another candidate"
                                                  if prob.has_min else
                                                  "f is smaller elsewhere on S (no global min)"))
         glob = "Global: " + ";  ".join(parts or ["unknown"])
@@ -780,7 +554,7 @@ def describe(prob, sel):
 def summary(prob, sel):
     gmax = [cp for cp in prob.points if cp.glob in ("max", "both")]
     gmin = [cp for cp in prob.points if cp.glob in ("min", "both")]
-    extreme = lambda cps, word: (f"global {word} {_fmt(cps[0].f)} at {len(cps)} point"
+    extreme = lambda cps, word: (f"global {word} {fmt(cps[0].f)} at {len(cps)} point"
                                  + "s" * (len(cps) > 1) if cps else f"no global {word}")
     lines = ["Feasible set: " + prob.S_text,
              f"Result: {extreme(gmax, 'max')},  {extreme(gmin, 'min')}",
@@ -790,52 +564,31 @@ def summary(prob, sel):
     for i in range(start, min(start + LIST_ROWS, len(prob.points))):
         cp = prob.points[i]
         mark = "▸" if i == sel else "   "
-        lines.append(f"{mark} {i + 1}. {_vec(cp.p)}   f = {_fmt(cp.f)}   {label(cp)}"
+        lines.append(f"{mark} {i + 1}. {vec(cp.p)}   f = {fmt(cp.f)}   {label(cp)}"
                      + ("   ◇ CQ fails" if not cp.cq else ""))
     if len(prob.points) > LIST_ROWS:
         lines.append(f"     ({len(prob.points)} points in all)")
     return "\n".join(lines + prob.notes)
 
 
-class TestsWindow:
+class TestsWindow(SecondaryWindow):
     """Separate window with the second-order and global tests for the selected point."""
 
+    TITLE = "Lagrange multipliers: tests"
     # (heading, top of the section) in figure coordinates; each body starts just below.
     SECTIONS = (("Selected point", 0.89), ("Second-order sufficient condition", 0.73),
                 ("Verdict", 0.57), ("Feasible set and all critical points", 0.39))
-
-    def __init__(self, on_close):
-        self.fig = plt.figure(figsize=(11, 7))
-        self.fig.canvas.manager.set_window_title("Lagrange multipliers: tests")
-        self.bodies = []
-        for heading, y in self.SECTIONS:
-            self.fig.text(0.03, y, heading.upper(), va="bottom", fontsize=9, fontweight="bold",
-                          color="dimgray")
-            self.fig.add_artist(Line2D([0.03, 0.97], [y - 0.008] * 2, color="lightgray", lw=1,
-                                       transform=self.fig.transFigure))
-            self.bodies.append(self.fig.text(0.03, y - 0.03, "", va="top", fontsize=11,
-                                             linespacing=1.4))
-        self.bodies[2].set_fontweight("bold")
-        self.fig.canvas.mpl_connect("close_event", lambda _: on_close())
-        self.fig.show()
+    VERDICT = 2
 
     def update(self, prob, sel):
         point, tests, verdict, color = describe(prob, sel)
-        self.fig.suptitle(title(prob), fontsize=13)
-        for body, text in zip(self.bodies, (point, tests, verdict, summary(prob, sel))):
-            body.set_text(text)
-        # Verdict in a tinted box of its own color.
-        self.bodies[2].set_color(color)
-        self.bodies[2].set_bbox({"boxstyle": "round,pad=0.5", "facecolor": to_rgba(color, 0.08),
-                                 "edgecolor": color} if verdict else None)
-        self.fig.canvas.draw_idle()
-
-    def raise_(self):
-        self.fig.canvas.manager.show()
+        self.set_texts(title(prob), (point, tests, verdict, summary(prob, sel)), color)
 
 
-def main():
+def build():
+    """Create the visualizer window and return its figure (call plt.show() to run it)."""
     fig = plt.figure(figsize=(13, 8))
+    fig.canvas.manager.set_window_title("Lagrange multipliers")
     prob = parse(F_INIT, G_INIT, W_INIT)
     state = {"prob": prob, "view": View(fig, prob), "sel": 0 if prob.points else None,
              "tests": None}
@@ -936,6 +689,13 @@ def main():
     make_k_slider()
     fig.suptitle(title(prob))
     update()
+    # The canvas holds only weak references to widgets, so keep them alive with the figure.
+    fig._keep = [tb_f, tb_g, tb_w, b_prev, b_next, b_tests, alpha_sliders, state]
+    return fig
+
+
+def main():
+    build()
     plt.show()
 
 

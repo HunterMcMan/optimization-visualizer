@@ -1,0 +1,3 @@
+pyinstaller
+imageio-ffmpeg
+edge-tts

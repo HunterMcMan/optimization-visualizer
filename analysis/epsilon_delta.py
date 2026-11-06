@@ -405,8 +405,10 @@ def title(prob):
     return rf"$f(x, y) = {sp.latex(prob.expr)}$,   $a = ({a})$,   $L = {prob.L:.4g}$"
 
 
-def main():
+def build():
+    """Create the visualizer window and return its figure (call plt.show() to run it)."""
     fig = plt.figure(figsize=(11, 8))
+    fig.canvas.manager.set_window_title("ε-δ limits")
     prob = parse(F_INIT, A_INIT)
     state = {"prob": prob, "view": make_view(fig, prob)}
 
@@ -479,6 +481,13 @@ def main():
         slider.on_changed(update)
     fig.suptitle(title(prob))
     update()
+    # The canvas holds only weak references to widgets, so keep them alive with the figure.
+    fig._keep = [tb_f, tb_a, s_eps, s_delta, alpha_sliders, state]
+    return fig
+
+
+def main():
+    build()
     plt.show()
 
 
